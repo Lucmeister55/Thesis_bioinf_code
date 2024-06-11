@@ -1,0 +1,855 @@
+# RNA analysis with DESeq2
+
+```{r message=FALSE}
+library(dplyr)
+library(dbplyr)
+library(readr)
+library(DESeq2)
+library(pheatmap)
+library(rje)
+library(ashr)
+library(ggplot2)
+library(pcaExplorer)
+library(tibble)
+library(RColorBrewer)
+library(AnnotationDbi)
+library(AnnotationHub)
+library(org.Hs.eg.db)
+library(gplots)
+library(gage)
+library(ensembldb)
+library(clusterProfiler)
+library(magrittr)
+library(EnrichmentBrowser)
+library(R.utils)
+library(fgsea)
+library(data.table)
+library(WebGestaltR)
+library(UpSetR)
+library(gridExtra)
+```
+
+## 1. Read count table
+
+```{r}
+countdata_NB <- read.delim("count_matrices/countmatrix_NB.csv")
+countdata_newIMR <- read.delim("count_matrices/countmatrix_newIMR.csv")
+countdata_sensSHY <- read.delim("count_matrices/countmatrix_sensSHY.csv")
+countdata_MM <- read.delim("count_matrices/countmatrix_MM.csv")
+```
+
+
+```{r}
+countdata_all <- cbind(subset(countdata_NB, select = -c(gene_symbol, Ensembl_ID, length)), subset(countdata_newIMR, select = -c(gene_symbol, Ensembl_ID, length)), subset(countdata_MM, select = -c(gene_symbol, Ensembl_ID, length)), subset(countdata_sensSHY, select = -c(gene_symbol, Ensembl_ID, length)))
+
+rownames(countdata_sensSHY) <- countdata_sensSHY$Ensembl_ID
+
+countdata_sensSHY <- subset(countdata_sensSHY, select = -c(gene_symbol, Ensembl_ID, length))
+
+rownames(countdata_all) <- countdata_NB$Ensembl_ID
+```
+
+## 2. Read sample table
+
+```{r}
+sampleTable_exp <- read_csv("ont_metadata.csv") %>%
+  mutate("Group" = factor(Group)) %>%
+  mutate("gender" = factor(gender)) %>%
+  mutate("tumor_type" = factor(tumor_type))
+
+head(sampleTable_exp)
+```
+
+# Full DESeq data object
+
+```{r}
+new_ids <- sampleTable_exp$sample_id_adj[match(colnames(countdata_all), sampleTable_exp$run_id_rnaseq)]
+colnames(countdata_all) <- new_ids
+head(countdata_all)
+```
+
+```{r}
+new_ids <- sampleTable_exp$sample_id_adj[match(colnames(countdata_sensSHY), sampleTable_exp$run_id_rnaseq)]
+colnames(countdata_sensSHY) <- new_ids
+head(countdata_sensSHY)
+```
+
+```{r}
+countdata_filt <- countdata_all %>%
+  dplyr::select(-c("SHY14nov_R3_2", "IMR15dec_R4", "IMR12dec_R3"))
+
+sampleTable_exp_filt = sampleTable_exp[sampleTable_exp$sample_id_adj %in% colnames(countdata_filt), ]
+rownames(sampleTable_exp_filt) <- sampleTable_exp_filt$sample_id_adj
+
+# Next, we need to reorder the rows of sampleTable_exp_filt based on the order of the columns in countdata_filt
+sampleTable_exp_filt_reordered <- sampleTable_exp_filt[match(colnames(countdata_filt), rownames(sampleTable_exp_filt)), ]
+
+rownames(sampleTable_exp_filt_reordered) <- sampleTable_exp_filt_reordered$sample_id_adj
+
+# Now, we can create the DESeqDataSet using the reordered sample table
+dds_full <- DESeqDataSetFromMatrix(countdata_filt, sampleTable_exp_filt_reordered, design = ~ Group)
+dds_full$Group <- relevel(dds_full$Group, "S")
+dds_full <- estimateSizeFactors(dds_full)
+
+dds_MM <- dds_full[, colData(dds_full)$tumor_type == "MM"]
+dds_MM$Group <- factor(droplevels(dds_MM$Group))
+dds_NB <- dds_full[, colData(dds_full)$tumor_type == "NB"]
+
+design(dds_full) <- ~ tumor_type + Group
+```
+
+```{r}
+sampleTable_exp_filt = sampleTable_exp[sampleTable_exp$sample_id_adj %in% colnames(countdata_sensSHY), ]
+rownames(sampleTable_exp_filt) <- sampleTable_exp_filt$sample_id_adj
+
+# Next, we need to reorder the rows of sampleTable_exp_filt based on the order of the columns in countdata_filt
+sampleTable_exp_filt_reordered <- sampleTable_exp_filt[match(colnames(countdata_sensSHY), rownames(sampleTable_exp_filt)), ]
+
+rownames(sampleTable_exp_filt_reordered) <- sampleTable_exp_filt_reordered$sample_id_adj
+
+dds_sensSHY <- DESeqDataSetFromMatrix(countdata_sensSHY, sampleTable_exp_filt_reordered, design = ~ Group)
+
+dds_sensSHY$Group <- relevel(dds_sensSHY$Group, "Ss")
+dds_sensSHY <- estimateSizeFactors(dds_sensSHY)
+```
+
+
+# Sample distances
+
+Calculate a *distance matrix*, quantifying dissimilarity of the samples
+
+```{r}
+sample_distance_heatmap <- function(dds, dir, affix) {
+  #Used different transformations
+  distmat <- as.matrix(dist(t(log2(1 + counts(dds)))))
+  distmat_norm <- as.matrix(dist(t(log2(1 + counts(dds, normalized=TRUE)))))
+  distmat_vst <- as.matrix(dist(t(assay(vst(dds))))) # Can only be performed if the DE is already performed
+
+  jpeg(paste0(dir, "/Distance_matrix_as_heatmap_normalized_", affix, ".jpeg"), width = 750, height = 750)
+  pheatmap(distmat_norm)
+  dev.off()
+  
+  jpeg(paste0(dir, "/Distance_matrix_as_heatmap_vst_", affix, ".jpeg"), width = 750, height = 750)
+  pheatmap(distmat_vst)
+  dev.off()
+  
+  # Switch off clustering
+  
+  jpeg(paste0(dir, "/Distance_matrix_noclus_as_heatmap_normalized_", affix, ".jpeg"), width = 750, height = 750)
+  pheatmap(distmat_norm,cluster_rows=FALSE, cluster_cols=FALSE)
+  dev.off()
+  
+  jpeg(paste0(dir, "/Distance_matrix_noclus_as_heatmap_vst_", affix, ".jpeg"), width = 750, height = 750)
+  pheatmap(distmat_vst,cluster_rows=FALSE, cluster_cols=FALSE)
+  dev.off()
+}
+```
+
+Visualize the distance matrix as heatmap
+
+```{r fig.width=12, fig.height=12}
+affixes <- c("full", "NB", "MM", "sensSHY")
+dds_list <- list(dds_full, dds_NB, dds_MM, dds_sensSHY)
+dir <- "outputs/DataExploration"
+dir.create(dir)
+
+for (i in seq_along(dds_list)) {
+  sample_distance_heatmap(dds_list[[i]], dir, affixes[i])
+}
+```
+
+# PCA plot
+
+```{r}
+library(ggplot2)
+library(gridExtra)
+
+dir <- "outputs/DataExploration"
+dir.create(dir, showWarnings = FALSE)
+
+# Variance stabilizing transformation
+rld_full <- vst(dds_full)
+rld_NB <- vst(dds_NB)
+rld_MM <- vst(dds_MM)
+rld_sensSHY <- vst(dds_sensSHY)
+
+# Define a helper function to create PCA plots with custom colors and shapes
+create_pca_plot <- function(data, title, ntop = 500) {
+  pca_plot <- pcaplot(data, title = title, intgroup = c("Group", "tumor_type"), ellipse = TRUE, text_labels = TRUE, ntop = ntop) +
+    theme(
+      aspect.ratio = 1,
+      plot.margin = unit(c(1, 1, 1, 1), "cm"),
+      plot.title = element_text(size = 14)
+    )
+  return(pca_plot)
+}
+
+# Create and save individual PCA plots
+pca_full_ntop500 <- create_pca_plot(rld_full, "PCA plot - top 500 variable genes - full")
+pca_NB_ntop500 <- create_pca_plot(rld_NB, "PCA plot - top 500 variable genes - NB")
+pca_MM_ntop500 <- create_pca_plot(rld_MM, "PCA plot - top 500 variable genes - MM")
+pca_sensSHY_ntop500 <- create_pca_plot(rld_sensSHY, "PCA plot - top 500 variable genes - sensSHY")
+
+# Save individual PCA plots with the same dimensions
+ggsave(paste0(dir, "/PCA_full_ntop500.png"), plot = pca_full_ntop500, width = 6, height = 6)
+ggsave(paste0(dir, "/PCA_NB_ntop500.png"), plot = pca_NB_ntop500, width = 6, height = 6)
+ggsave(paste0(dir, "/PCA_MM_ntop500.png"), plot = pca_MM_ntop500, width = 6, height = 6)
+ggsave(paste0(dir, "/PCA_sensSHY_ntop500.png"), plot = pca_sensSHY_ntop500, width = 6, height = 6)
+
+# Combine the PCA plots into one image with equal spacing
+png(paste0(dir, "/PCA_combined_plots_ntop500.png"), width = 1200, height = 1200)
+grid.arrange(pca_full_ntop500, pca_NB_ntop500, pca_MM_ntop500, pca_sensSHY_ntop500, ncol = 2, nrow = 2)
+dev.off()
+
+# Create and save individual PCA plots
+pca_full_ntop10000 <- create_pca_plot(rld_full, "PCA plot - top 10,000 variable genes - full", ntop = 10000)
+pca_NB_ntop10000 <- create_pca_plot(rld_NB, "PCA plot - top 10,000 variable genes - NB", ntop = 10000)
+pca_MM_ntop10000 <- create_pca_plot(rld_MM, "PCA plot - top 10,000 variable genes - MM", ntop = 10000)
+pca_sensSHY_ntop10000 <- create_pca_plot(rld_sensSHY, "PCA plot - top 10,000 variable genes - sensSHY", ntop = 10000)
+
+# Save individual PCA plots with the same dimensions
+ggsave(paste0(dir, "/PCA_full_ntop10000.png"), plot = pca_full_ntop10000, width = 6, height = 6)
+ggsave(paste0(dir, "/PCA_NB_ntop10000.png"), plot = pca_NB_ntop10000, width = 6, height = 6)
+ggsave(paste0(dir, "/PCA_MM_ntop10000.png"), plot = pca_MM_ntop10000, width = 6, height = 6)
+ggsave(paste0(dir, "/PCA_sensSHY_ntop10000.png"), plot = pca_sensSHY_ntop10000, width = 6, height = 6)
+
+```
+
+
+# Two-group comparison
+
+For our setup, we want to compare R and S
+
+## 1. Size factors and metadata
+
+```{r}
+# Calculate sizeFactors (should be 1)
+
+for (i in seq_along(dds_list)) {
+  dds <- dds_list[[i]]
+  print(affixes[i])
+  print(sizeFactors(dds))
+}
+```
+
+
+## 2. Set design
+
+```{r}
+dir.create("outputs/DifferentialAnalysis")
+
+dds_deseq_list = list()
+
+for (i in seq_along(dds_list)) {
+  dds <- dds_list[[i]]
+  affix <- affixes[[i]]
+  print(affix)
+
+  dds_deseq <- DESeq(dds)
+  
+  if (affix == "full" | affix == "NB") {
+    contrasts <- list(c("Group", "R", "S"), c("Group", "R", "Ss"), c("Group", "S", "Ss"))
+  } else if (affix == "sensSHY") {
+    contrasts <- list(c("Group", "R", "Ss"))
+  } else {
+    contrasts <- list(c("Group", "R", "S"))
+  }
+  
+  for (contrast in contrasts) {
+    print(paste(contrast, collapse = "_"))
+    res <- results(dds_deseq, alpha = 0.05, contrast = contrast)
+    summary(res)
+    jpeg(paste0("outputs/DifferentialAnalysis/dispersion_plot_", affix, "_", paste(contrast, collapse = "_"), ".jpeg"), 
+         width = 1500, height = 1000)
+    plotDispEsts(dds_deseq)
+    dev.off()
+    
+    dds_deseq_list <- c(dds_deseq_list, dds_deseq)
+  }
+}
+```
+```{r}
+contrasts <- list(c("Group", "R", "S"), c("Group", "R", "Ss"), c("Group", "S", "Ss"), c("Group", "R", "S"), c("Group", "R", "Ss"), c("Group", "S", "Ss"), c("Group", "R", "S"), c("Group", "R", "Ss"))
+affixes <- list("full", "full", "full", "NB", "NB", "NB", "MM", "sensSHY")
+
+# Combine the elements from both lists
+combined_list <- gsub(" ", "", paste0(affixes, "_", sapply(contrasts, function(x) paste(x[length(x) - 1], "_vs_", x[length(x)], collapse = ""))))
+
+# Print the combined list
+print(combined_list)
+```
+
+## 3. Get the results
+
+```{r}
+res_lfc_list <- list()
+
+for (i in seq_along(dds_deseq_list)) {
+  dds <- dds_deseq_list[[i]]
+  affix <- affixes[i]
+  print(affix)
+  contrast = contrasts[[i]]
+  print(paste(contrast, collapse = "_"))
+   
+  resultsNames(dds)
+  res <- results(dds, independentFiltering=TRUE, contrast=contrast, alpha = 0.05) #Last level is the base level
+  res_all <- results(dds, independentFiltering=TRUE, contrast=contrast)
+  
+  sink(paste0("outputs/DifferentialAnalysis/results_summary_", affix, "_", paste(contrast, collapse = "_"), ".txt"))
+  summary(res)
+  sink()
+  
+  res_lfc <- lfcShrink(dds, contrast = contrast, type = "ashr", alpha = 0.05, res = res)
+  res_lfc_all <- lfcShrink(dds, contrast = contrast, type = "ashr", res = res_all)
+  
+  sink(paste0("outputs/DifferentialAnalysis/resultsLFC_summary_", affix, "_", paste(contrast, collapse = "_"), ".txt"))
+  summary(res_lfc)
+  sink()
+  
+  res_lfc_list <- c(res_lfc_list, res_lfc_all)
+}
+```
+
+## PCA (DGE only)
+
+```{r}
+# Create a list to store PCA plots
+pca_plots <- vector("list", length = length(dds_deseq_list))
+
+# Perform PCA and generate plots
+for (i in seq_along(dds_deseq_list)) {
+  dds <- dds_deseq_list[[i]]
+  res <- res_lfc_list[[i]] 
+  affix <- affixes[i]
+  print(affix)
+  contrast = contrasts[[i]]
+  print(paste(contrast, collapse = "_"))
+  
+  rld <- vst(dds)
+  
+  dge_genes <- rownames(res)[which(res$padj < 0.05)]
+  
+  # Filter expression data matrices to include only DEGs
+  rld_dge <- rld[dge_genes,]
+  
+  # Perform PCA
+  pca_result <- prcomp(t(assay(rld_dge)))
+  
+  # Store PCA result
+  pca_plots[[i]] <- list(pca_result = pca_result, affix = affix)
+}
+
+# Generate PCA plots
+for (i in seq_along(pca_plots)) {
+  pca_result <- pca_plots[[i]]$pca_result
+  affix <- pca_plots[[i]]$affix
+  contrast = contrasts[[i]]
+  
+  png(paste0(dir, paste0("/PCA_", affix, "_", paste(contrast, collapse = "_"), "_dge.png")), width = 900, height = 900)
+  
+  plot(pca_result$x[,1], pca_result$x[,2], 
+       xlab = paste("PC1 (", round(100 * summary(pca_result)$importance[2,1], 1), "%)", sep=""),
+       ylab = paste("PC2 (", round(100 * summary(pca_result)$importance[2,2], 1), "%)", sep=""), 
+       main = paste("PCA of", affix, "_", paste(contrast, collapse = "_"), "DEGs"))
+  
+  # Add labels to points
+  text(pca_result$x[,1], pca_result$x[,2], labels = rownames(pca_result$x), cex=0.7, pos=3)
+  
+  dev.off()
+}
+```
+
+
+Other plotting functions
+## 5. Plotting: PCA, MA-plot, Volcano, heatmap, etc...
+
+```{r}
+# Set generic dds and res, condition, resdata and resdata_annot
+
+###########SECTION TO BE ADJUSTED#######
+condition_name <- "Group"
+celline <- "human"
+###########SECTION TO BE ADJUSTED#######
+
+resdata_list <- list()
+
+for (i in seq_along(dds_deseq_list)) {
+  res <- res_lfc_list[[i]]
+  dds <- dds_deseq_list[[i]]
+  affix <- affixes[i]
+  print(affix)
+  
+  resdata <- merge(as.data.frame(res), as.data.frame(counts(dds, normalized=TRUE)), by="row.names", sort=FALSE)
+
+  names(resdata)[1] <- "Gene"
+  rownames(resdata) <- resdata$Gene
+  resdata <- resdata[-1]
+  head(resdata)
+  
+  resdata_list <- c(resdata_list, list(resdata))
+}
+```
+
+
+```{r}
+annotdata <- read.table("mart_export.txt",sep = '\t', header=TRUE)
+colnames(annotdata) <- c('ensg','name','type','description')
+
+#Check for non-unique ensg and remove duplicates if necessary
+n_occur <- data.frame(table(annotdata$ensg))
+annotdata[annotdata$ensg %in% n_occur$Var1[n_occur$Freq == 1],]
+
+# Manually erase from annotation file where necessary
+
+rownames(annotdata) <- annotdata$ensg
+annotdata <- annotdata[-1]
+head(annotdata)
+
+resdata_annot_list <- list()
+
+for (i in seq_along(resdata_list)) {
+  resdata <- resdata_list[[i]]
+  affix <- affixes[i]
+  print(affix)
+  
+  resdata_annot <- merge(as.data.frame(resdata),as.data.frame(annotdata),by="row.names",all.x= TRUE)
+  rownames(resdata_annot) <- resdata_annot$Row.names
+  resdata_annot <- resdata_annot[-1]
+  
+  resdata_annot_list <- c(resdata_annot_list, list(resdata_annot))
+}
+
+names(resdata_annot_list) <- combined_list
+```
+
+
+```{r}
+# Regularized log transformation for clustering/heatmaps, etc
+
+rld_list <- list()
+
+for (i in seq_along(dds_deseq_list)) {
+  dds <- dds_deseq_list[[i]]
+  affix <- affixes[i]
+  print(affix)
+  contrast = contrasts[[i]]
+  print(contrast)
+  
+  rld <- vst(dds)
+  head(assay(rld))
+  
+  png(paste0("outputs/DifferentialAnalysis/rld_hist_", affix, "_", paste(contrast, collapse = "_"), ".png"))
+  hist(assay(rld))
+  dev.off()
+  
+  rld_list <- c(rld_list, rld)
+}
+```
+
+
+```{r}
+condition_list <- list()
+
+for (i in seq_along(dds_deseq_list)) {
+  dds <- dds_deseq_list[[i]]
+  rld <- rld_list[[i]]
+  affix <- affixes[i]
+  print(affix)
+  contrast = contrasts[[i]]
+  print(contrast)
+  
+  condition <- colData(dds)$Group
+  
+  mycols <- brewer.pal(8, "Dark2")[1:length(unique(condition))]
+
+  # Sample distance heatmap
+  
+  sampleDists <- as.matrix(dist(t(assay(rld))))
+  
+  png(paste0("outputs/DifferentialAnalysis/heatmap_sampdist_", affix, "_", paste(contrast, collapse = "_"), ".png"))
+  heatmap.2(as.matrix(sampleDists), key=F, trace="none",
+            col=colorpanel(100, "black", "white"),
+            ColSideColors=mycols[condition], RowSideColors=mycols[condition],
+            margin=c(20, 20), main="Sample Distance Matrix")
+  dev.off()
+  
+  condition_list <- list(condition_list, condition)
+}
+```
+
+
+```{r}
+for (i in seq_along(resdata_annot_list)) {
+  resdata_annot <- resdata_annot_list[[i]]
+  res <- res_lfc_list[[i]]
+  affix <- affixes[i]
+  print(affix)
+  contrast = paste(contrasts[[i]], collapse = "_")
+  print(contrast)
+  
+  DE_file_name <- paste("outputs/DifferentialAnalysis/DE_results_",celline,"_",contrast,"_", affix,".csv", sep="" )
+
+  ## Order by adjusted p-value
+  resdata_annot <- resdata_annot[order(resdata_annot$padj), ]
+  
+  ## Write results
+  write.csv(resdata_annot, DE_file_name)
+  
+  ## Examine plot of p-values
+  png(paste("outputs/DifferentialAnalysis/DE_pvalplot_",celline,"_",contrast,"_", affix, ".png", sep=""), 1500, 1000, pointsize=20)
+  hist(resdata_annot$pvalue, breaks=50, col="grey")
+  dev.off()
+  
+  ## MA-plot
+  
+  maplot <- function (res, thresh=0.05, labelsig=TRUE, textcx=1, ...) {
+  with(res, plot(baseMean, log2FoldChange, pch=20, cex=.5, log="x", ...))
+  with(subset(res, padj<thresh), points(baseMean, log2FoldChange, col="red", pch=20, cex=0.5))
+  if (labelsig) {
+    require(calibrate)
+    }
+  }
+  
+  png(paste("outputs/DifferentialAnalysis/DE_MAplot_",celline,"_",contrast,"_", affix, ".png", sep=""), 1500, 1000, pointsize=20)
+  maplot(resdata_annot, main="MA Plot", ylim=c(-10,10))
+  dev.off()
+  
+  resdata_annot_notnull <- resdata_annot %>% dplyr::filter(padj !=0)
+  minpvaladj <- min(resdata_annot_notnull$padj, na.rm = TRUE)
+  
+  ## Volcano plot with "significant" genes labeled
+  volcanoplot <- function (res, lfcthresh=1, sigthresh=0.05, main="Volcano Plot", legendpos="bottomleft", labelsig=TRUE, textcx=1, ...) {
+    with(res, plot(log2FoldChange, -log10(pvalue+minpvaladj), pch=20, main=main, ...))
+    with(subset(res, padj<sigthresh ), points(log2FoldChange, -log10(pvalue+minpvaladj), pch=20, col="red", ...))
+    with(subset(res, abs(log2FoldChange)>lfcthresh), points(log2FoldChange, -log10(pvalue+minpvaladj), pch=20, col="orange", ...))
+    with(subset(res, padj<sigthresh & abs(log2FoldChange)>lfcthresh), points(log2FoldChange, -log10(pvalue+minpvaladj), pch=20, col="green", ...))
+    if (labelsig) {
+      require(calibrate)
+    }
+    legend(legendpos, xjust=1, yjust=1, legend=c(paste("FDR<",sigthresh,sep=""), paste("|LogFC|>",lfcthresh,sep=""), "both"), pch=20, col=c("red","orange","green"))
+  }
+  png(paste("outputs/DifferentialAnalysis/DE_volcano_",celline,"_",contrast,"_", affix, ".png", sep=""), 1200, 1000, pointsize=20)
+  volcanoplot(resdata_annot, lfcthresh=1, sigthresh=0.05, textcx=.8, xlim=c(-10, 10), ylim=c(0,10))
+  dev.off()
+}
+```
+
+
+# Heatmap of top expression results
+
+```{r}
+
+###########SECTION TO BE ADJUSTED#######
+condition_name <- "Group"
+celline <- "human"
+###########SECTION TO BE ADJUSTED#######
+
+for (i in seq_along(dds_deseq_list)) {
+  dds <- dds_deseq_list[[i]]
+  res <- res_lfc_list[[i]]
+  affix <- affixes[i]
+  print(affix)
+  contrast = paste(contrasts[[i]], collapse = "_")
+  print(contrast)
+  
+  vsd <- vst(dds)
+  vsd_assay <- assay(vsd)
+  vsd_assay <- as.data.frame(vsd_assay)
+  vsd_assay$Gene <- rownames(vsd_assay)
+  
+  ## Merge with normalized count data
+  resdata <- merge(as.data.frame(res), vsd_assay, by="row.names", sort=FALSE)
+  names(resdata)[1] <- "Gene"
+  rownames(resdata) <- resdata$Gene
+  resdata <- resdata[-1]
+  
+  #Merge with annotation (genesymbol and geneType)
+  resdata_annot <- merge(as.data.frame(resdata),as.data.frame(annotdata),by="row.names",all.x= TRUE)
+  rownames(resdata_annot) <- resdata_annot$Row.names
+  resdata_annot <- resdata_annot[-1]
+  
+  # Selection on padj <= 0.05
+  res$padj <- ifelse(is.na(res$padj), 1, res$padj)
+  sigGenes <- rownames(res[res$padj <= .05,])
+  
+  resdata_annot <- resdata_annot[resdata_annot$Gene %in% sigGenes,]
+  
+  mat = resdata_annot[ head(order(resdata_annot$padj),50), ] # select the top 50 genes with the lowest padj
+  rownames(mat) <- paste(mat$Gene, mat$name, sep="_")
+  mat$log2FoldChange <- NULL
+  mat$lfcSE <- NULL
+  mat$stat <- NULL
+  mat$pvalue <- NULL
+  mat$baseMean <- NULL
+  mat$padj <- NULL
+  mat$Gene <- NULL
+  mat$name <- NULL
+  mat$type <- NULL
+  mat$description <- NULL
+  
+  mat = mat - rowMeans(mat) # Subtract the row means from each value
+  # Optional, but to make the plot nicer:
+  df = as.data.frame(colData(vsd)[,c("Group")]) # Create a dataframe with a column of the conditions
+  colnames(df) = "Group" # Rename the column header
+  rownames(df) = colnames(mat) # add rownames
+  # and plot the actual heatmap
+  png(paste("outputs/DifferentialAnalysis/genes_heatmap_",celline,"_",contrast,"_", affix, ".png", sep=""), 1200, 1000, pointsize=20)
+  pheatmap(mat, annotation_col=df)
+  dev.off()
+}
+```
+
+```{r}
+for (i in seq_along(dds_deseq_list)) {
+  dds <- dds_deseq_list[[i]]
+  res <- res_lfc_list[[i]]
+  affix <- affixes[i]
+  print(affix)
+  
+  rld <- vst(dds)
+  
+  # make the lists
+  upgenes <- rownames(head(res[ order( res$log2FoldChange ), ], n=20))
+  downgenes <- rownames(head(res[ order( -res$log2FoldChange ), ], n=20))
+
+  # this gives us the rows we want
+  rows <- match(upgenes, row.names(rld))
+  mat <- assay(rld)[rows,]
+  mat <- mat - rowMeans(mat)
+
+  # the labels are hard coded at the moment :(
+  df <- as.data.frame(colData(rld)[c(condition_name)])
+  png(paste("outputs/DifferentialAnalysis/top20UP_",celline,"_",contrast,"_", affix, ".png", sep=""))
+  pheatmap(mat, fontsize=5, annotation_col=df, main=paste(affix,"top 20 up genes"))
+  dev.off()
+
+  # this gives us the rows we want
+  rows <- match(downgenes, row.names(rld))
+  mat <- assay(rld)[rows,]
+  mat <- mat - rowMeans(mat)
+
+  df <- as.data.frame(colData(rld)[c(condition_name)])
+  png(paste("outputs/DifferentialAnalysis/top20DOWN_",celline,"_",contrast,"_", affix, ".png", sep=""))
+  pheatmap(mat, fontsize=5, annotation_col=df, main=paste(affix,"top 20 down genes"))
+  dev.off()
+}
+```
+
+```{r}
+# Example data (replace this with your own data)
+gene_sets_up <- list()
+gene_sets_down <- list()
+
+for (i in seq_along(resdata_annot_list)) {
+  title = combined_list[[i]]
+  resdata_annot <- resdata_annot_list[[i]] %>%
+    filter(padj < 0.05) %>%
+    filter(log2FoldChange > 0)
+  gene_sets_up[[title]] <- unique(na.omit(resdata_annot$name))
+}
+
+for (i in seq_along(resdata_annot_list)) {
+  title = combined_list[[i]]
+  resdata_annot <- resdata_annot_list[[i]] %>%
+    filter(padj < 0.05) %>%
+    filter(log2FoldChange < 0)
+  gene_sets_down[[title]] <- unique(na.omit(resdata_annot$name))
+}
+
+generate_upset_plot <- function(gene_sets, ylabel, file){
+  # Create UpSet plot
+  upset_data <- fromList(gene_sets)
+  upset_plot <- upset(upset_data, 
+                      sets = names(gene_sets), 
+                      keep.order = TRUE, 
+                      mainbar.y.label = ylabel,
+                      nintersects = 20,
+                      order.by = "freq",
+                      text.scale = 3)
+  
+  print(upset_plot)
+  
+  # Save the plot as a PNG file with increased resolution
+  png(file, width = 1900, height = 1200, pointsize = 5)
+  print(upset_plot)
+  dev.off()
+}
+
+sel <- c("full_R_vs_S", "full_R_vs_Ss", "NB_R_vs_S", "NB_R_vs_Ss", "MM_R_vs_S", "sensSHY_R_vs_Ss")
+
+generate_upset_plot(gene_sets_up[sel], "Gene Symbol Intersection Size - Upregulated", "outputs/DifferentialAnalysis/upset_plot_up.png")
+generate_upset_plot(gene_sets_down[sel], "Gene Symbol Intersection Size - Downregulated","outputs/DifferentialAnalysis/upset_plot_down.png")
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Function to calculate set sizes and percentages
+calculate_set_sizes <- function(gene_sets, whitelist_genes) {
+  set_sizes <- sapply(gene_sets, length)
+  intersect_sizes <- sapply(gene_sets, function(genes) length(intersect(genes, whitelist_genes)))
+  percentages <- (intersect_sizes / set_sizes) * 100
+  
+  data.frame(
+    Set = names(gene_sets),
+    Total_Size = set_sizes,
+    FRG_Size = intersect_sizes,
+    Percentage_FRG = percentages
+  )
+}
+
+# Generate combined bar plot with green fill color
+generate_combined_bar_plot <- function(set_data, gene_sets, title, ylabel, file) {
+  # Exclude the "whitelist" bar
+  set_data <- set_data[set_data$Set != "whitelist", ]
+  
+  # Ensure the factor levels for the Set column match the order given by gene_sets
+  set_data$Set <- factor(set_data$Set, levels = unique(set_data$Set))
+  
+  ggplot(set_data, aes(x = Set, fill = Regulation)) +
+    geom_bar(aes(y = Total_Size), position = "dodge", stat = "identity") +
+    geom_bar(aes(y = FRG_Size, x = as.numeric(Set) + ifelse(Regulation == "Downregulated", -0.225, 0.225)), 
+             position = "dodge", stat = "identity", fill = alpha("green", 0.5), width = 0.45) +
+    geom_text(aes(y = FRG_Size, label = paste0(round(Percentage_FRG, 1), "%")),
+              vjust = -0.5, size = 3, position = position_dodge(width = 0.9), color = "black") +
+    labs(y = ylabel, x = "Gene Sets") +
+    theme_classic() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+      axis.text.y = element_text(size = 12),
+      axis.title = element_text(size = 14),
+      plot.title = element_text(size = 16)
+    ) +
+    theme(legend.position = "bottom")
+  
+  ggsave(file, width = 12, height = 8)
+}
+
+# Read whitelist
+whitelist <- read.csv("complete_gene_list_no_duplicates_cleaned.txt", header = FALSE)
+whitelist_genes <- whitelist[, 1]
+
+# Prepare gene sets
+gene_sets_up <- list()
+gene_sets_down <- list()
+
+for (i in seq_along(resdata_annot_list)) {
+  title <- combined_list[[i]]
+  resdata_annot <- resdata_annot_list[[i]] %>%
+    filter(padj < 0.05) %>%
+    filter(log2FoldChange > 0)
+  gene_sets_up[[title]] <- unique(na.omit(resdata_annot$name))
+}
+
+for (i in seq_along(resdata_annot_list)) {
+  title <- combined_list[[i]]
+  resdata_annot <- resdata_annot_list[[i]] %>%
+    filter(padj < 0.05) %>%
+    filter(log2FoldChange < 0)
+  gene_sets_down[[title]] <- unique(na.omit(resdata_annot$name))
+}
+
+# Add whitelist to the sets
+gene_sets_up[["whitelist"]] <- whitelist_genes
+gene_sets_down[["whitelist"]] <- whitelist_genes
+
+# Calculate set sizes
+set_data_up <- calculate_set_sizes(gene_sets_up, whitelist_genes) %>%
+  mutate(Regulation = "Upregulated")
+set_data_down <- calculate_set_sizes(gene_sets_down, whitelist_genes) %>%
+  mutate(Regulation = "Downregulated")
+
+# Combine the datasets
+combined_set_data <- bind_rows(set_data_up, set_data_down)
+
+sel <- c("full_R_vs_S", "full_R_vs_Ss", "NB_R_vs_S", "NB_R_vs_Ss", "MM_R_vs_S", "sensSHY_R_vs_Ss")
+
+# Filter the combined_set_data based on sel
+combined_set_data_filtered <- combined_set_data %>%
+  filter(Set %in% sel)
+
+# Generate the combined bar plot
+generate_combined_bar_plot(combined_set_data_filtered, c(gene_sets_up, gene_sets_down), 
+                           "Differentially Expressed Gene Sets",
+                           "Gene Set Sizes", 
+                           "outputs/DifferentialAnalysis/combined_bar_plot.png")
+```
+
+
+```{r}
+# Function to generate summary of DEGs
+generate_deg_summary <- function(resdata_annot_list, selected_datasets = NULL, output_file = "DEG_summary.csv") {
+  # Initialize a dataframe to store the results
+  summary_df <- data.frame(
+    Dataset = character(), 
+    Total_DEGs = integer(), 
+    Upregulated = integer(), 
+    Downregulated = integer(), 
+    Percent_Upregulated = character(), 
+    Percent_Downregulated = character(), 
+    stringsAsFactors = FALSE
+  )
+  
+  # Determine which datasets to include
+  if (is.null(selected_datasets)) {
+    selected_datasets <- names(resdata_annot_list)
+  }
+  
+  # Iterate over each selected dataframe in the list
+  for (dataset_name in selected_datasets) {
+    resdata_annot <- resdata_annot_list[[dataset_name]] %>%
+        filter(padj < 0.05)
+    
+    resdata_upregulated <- resdata_annot %>%
+      filter(log2FoldChange > 0)
+    
+    resdata_downregulated <- resdata_annot %>%
+      filter(log2FoldChange < 0)
+    
+    upregulated <- length(unique(na.omit(resdata_upregulated$name)))
+    downregulated <- length(unique(na.omit(resdata_downregulated$name)))
+    
+    # Filter DEGs based on padj and log2FoldChange, omitting NA values
+    # upregulated <- sum(resdata_annot$padj < 0.05 & resdata_annot$log2FoldChange > 0, na.rm = TRUE)
+    # downregulated <- sum(resdata_annot$padj < 0.05 & resdata_annot$log2FoldChange < 0, na.rm = TRUE)
+    
+    # Calculate total DEGs
+    total_degs <- upregulated + downregulated
+    
+    # Calculate percentages and format them
+    percent_upregulated <- if (total_degs > 0) {
+      sprintf("%.2f%%", (upregulated / total_degs) * 100)
+    } else {
+      "0.00%"
+    }
+    
+    percent_downregulated <- if (total_degs > 0) {
+      sprintf("%.2f%%", (downregulated / total_degs) * 100)
+    } else {
+      "0.00%"
+    }
+    
+    # Append the results to the dataframe
+    summary_df <- rbind(summary_df, data.frame(
+      Dataset = dataset_name, 
+      Total_DEGs = total_degs, 
+      Upregulated = upregulated, 
+      Downregulated = downregulated,
+      Percent_Upregulated = percent_upregulated, 
+      Percent_Downregulated = percent_downregulated
+    ))
+  }
+  
+  # Write the results to a CSV file
+  write.csv(summary_df, output_file, row.names = FALSE)
+  
+  # Print the results for verification
+  print(summary_df)
+}
+generate_deg_summary(resdata_annot_list, sel, "DEG_summary.csv")
+```
+
+
+
+
